@@ -15,14 +15,17 @@ services:
       - /dev/infiniband:/dev/infiniband
 
     volumes:
-      # To serve weights already on disk instead of the HF cache, set
-      # LOCAL_MODELS_DIR=/data/models in .env.dspark and add an override file
-      # (docker-compose.local-models.yml) with:
-      #     services: {vllm-dspark: {volumes: ["${LOCAL_MODELS_DIR}:/models:ro"]}}
-      # then point DSPARK_MODEL at /models/<dir>. That directory must be real —
-      # a symlink to a path outside the mount resolves to something the container
-      # cannot see and vLLM falls back to treating it as an HF repo id
+      # Serve weights already on disk instead of downloading through the HF
+      # cache: set LOCAL_MODELS_DIR in .env.dspark (it reaches both nodes, since
+      # the launcher passes the env file to worker and head) and point
+      # DSPARK_MODEL at /models/<dir>. Defaults to the HF cache dir, so leaving
+      # it unset mounts nothing new.
+      #
+      # DSPARK_MODEL must name a real directory inside the mount — a symlink
+      # whose target lies outside it resolves to a host path the container
+      # cannot see, and vLLM then treats the value as an HF repo id
       # (HFValidationError: Repo id must be in the form ...).
+      - ${LOCAL_MODELS_DIR:-${HF_CACHE:-${HOME}/.cache/huggingface}}:/models:ro
       - ${HF_CACHE:-${HOME}/.cache/huggingface}:/cache/huggingface
       # DSpark source patches are baked into the image from recipe/overlay/
       # (see README "vLLM version note"); do not bind-mount a proposer copy
