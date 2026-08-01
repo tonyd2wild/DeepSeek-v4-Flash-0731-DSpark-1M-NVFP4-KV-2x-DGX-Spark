@@ -1,0 +1,320 @@
+# DeepSeek V4 Flash 0731 (official) DSpark — 1M context, NVFP4 KV — 2x DGX Spark
+#
+# sparkrun port of:
+#   https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark
+# (pinned to commit d728faee9f5a8d5ebafe7bc44bca6c5d8d0d192f, 2026-07-31)
+#
+# This is the recipe for DeepSeek's OFFICIAL `DeepSeek-V4-Flash-0731` release,
+# contributed via issue #9. See sparkrun/README.md for quick start and
+# measured results; the main repo README stays the reference for everything
+# else (tuning, troubleshooting, patch history).
+#
+# Fully reproducible, no manual image build: the recipe pulls the public
+# DSpark-enabled base image and reproduces tonyd2wild's
+# `vllm-dspark-runtime:dspark-nvfp4-stage-c` image at container start via
+# pre_exec (base overlay -> nvfp4 stage A/B/C patches). The overlay at this
+# pin already contains ALL known fixes:
+#   * Patch 3 (scheduler cold-prefill garble root fix; without it 44/44
+#     cold ~20K-token prompts garbled, warm requests never fail — invisible
+#     until production)
+#   * Patch 4 (DSpark draft loader shared-expert fix, 2026-07-31). vLLM's
+#     stock loader silently drops 12 draft tensors
+#     (layers.{43,44,45}.ffn.shared_experts.gate_up_proj.*); the draft's
+#     always-on shared expert then runs uninitialised. Output stays correct
+#     (the target verifies every token) but acceptance collapses:
+#     0731 measured 25.7% -> 60.2% acceptance, 32.7 -> 55.4 mean tok/s
+#     with the fix. On 0731 this patch is THE difference between "half
+#     speed" and the advertised numbers.
+#   * native non-uniform-batch handling in the proposer (concurrency>=2
+#     crash fix). NOTE: upstream's apply-nonuniform-guard.py is deliberately
+#     NOT run here — it is for foreign prebuilt images only. Stacking it on
+#     this overlay short-circuits the proposer's own ragged path and emits
+#     always-rejected dummy drafts ("Drafted: N, Accepted: 0" windows).
+#
+# Defaults = upstream's "CURRENT BEST" profile (DEFAULT-CONFIG.md,
+# re-measured 2026-07-29): 1M context, 6 slots, gmu 0.78, k=5.
+# Upstream-measured on 0731 + Patch 4: 55.4 tok/s mean / 66.1 peak by
+# content type (structured 66, codegen 62, prose 38), 78.4 tok/s peak-finder
+# at 98.9% acceptance. Decode is acceptance-bound and content-driven —
+# quote peak AND mean AND content type.
+#
+# IMPORTANT invariants (from the upstream repo):
+#   * num_speculative_tokens: k <= 5, or a multiple of 5. The 0731 drafter
+#     emits exactly dspark_block_size=5 tokens per pass: k=7 boots only if
+#     you patch the guard out and then crashes on the FIRST generation
+#     ("size of tensor a (7) must match tensor b (5)"); k=10 boots and
+#     crashes every generation. k=5 is ~24% faster than k=3. DeepSeek's own
+#     0731 model card recommends k=7 — that does not work on this runtime.
+#   * max_cudagraph_capture_size is deliberately NOT set: vLLM derives it
+#     from max_num_seqs x (k+1). A stale literal silently truncates capture
+#     under concurrency (upstream PR #5).
+#   * VLLM_USE_B12X_MOE=1 is the entire speed difference (~2x). =0 silently
+#     falls back to DEEPGEMM_MXFP4 (and measured worse, then crashed).
+#   * Do NOT add repetition_penalty / --override-generation-config
+#     (documented DSpark spec-decode crash: illegal memory access).
+#   * Do NOT set VLLM_USE_V2_MODEL_RUNNER=1 (hard reject with DSpark).
+#   * Do NOT pass --attention-backend FLASHINFER_MLA_SPARSE_DSV4
+#     (backend does not exist on this image; leave attention on AUTO).
+#   * gpu_memory_utilization 0.78: spec decode allocates buffers on the
+#     FIRST REAL REQUEST, not at boot — 0.80 boots, passes smoke tests,
+#     then dies under traffic (upstream issue #8). max_num_seqs 12 is a
+#     known trigger for the same crash class; 6 measured better under real
+#     traffic anyway.
+
+recipe_version: "2"
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+runtime: vllm
+# Digest-pinned tag `unholy-fusion-prod-ready` (resolved 2026-07-12) so the
+# base image is immutable even if the tag is later repushed. Upstream tested
+# the newer vLLM 0.25.2 runtime head-to-head on 2026-07-29 and kept this one
+# (0.25.2: -9% peak, -29% at c6 — no B12X kernels, no torch.compile path).
+container: ghcr.io/bjk110/vllm-spark@sha256:d8492e7677cf1b9aaa3344e0e6865efc468454013eee5ebabac85be90af027be
+min_nodes: 2
+max_nodes: 2
+
+metadata:
+  description: >-
+    DeepSeek V4 Flash 0731 (official release) with DSpark speculative
+    decoding on 2x DGX Spark (TP=2): 1M-token context, 4-bit nvfp4_ds_mla
+    KV cache, B12X MoE, draft-loader Patch 4. Upstream-measured ~55 tok/s
+    mean / 66 peak by content (78 peak-finder). Port of
+    tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark.
+  maintainer: tonyd2wild
+  category: agent
+  kv_dtype: nvfp4
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  served_model_name: deepseek-v4-flash-0731
+  kv_cache_dtype: nvfp4_ds_mla
+  block_size: 256
+  # 1,048,576 = the model's true YaRN ceiling (65536 x factor 16). The
+  # upstream 1.5M runs only force-extrapolate past calibration — keep 1M.
+  max_model_len: 1048576
+  # 6 slots / 0.78 gmu = upstream CURRENT BEST. 12/0.85 (the old C12 lane)
+  # boots fine but is the documented trigger profile for the issue-#8
+  # first-request OOM class; raise it only with eyes open.
+  max_num_seqs: 6
+  max_num_batched_tokens: 8192
+  gpu_memory_utilization: 0.78
+  tokenizer_mode: deepseek_v4
+  tool_call_parser: deepseek_v4
+  reasoning_parser: deepseek_v4
+  # k=5: the verified default (+24% over k=3; k is effectively locked to 5
+  # on this drafter — see invariants above). draft_sample_method is kept for
+  # parity with upstream's launcher but is a documented NO-OP on the DSpark
+  # path (the proposer never populates draft probs unless
+  # VLLM_DSPARK_EXPORT_DRAFT_PROBS=1); the garble fix is Patch 3, not this.
+  speculative_config: '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+  reasoning_config: '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+  chat_template_kwargs: '{"thinking":false}'
+
+# Defaults for `sparkrun benchmark run` (zero flags needed; -b/--profile
+# still override). DSpark decode speed depends on draft acceptance, which is
+# workload-dependent (structured ~66 tok/s, codegen ~62, prose ~38 on 0731),
+# and llama-benchy's default corpus is a Gutenberg novel — that would
+# under-report this recipe for coding/devops use. So the corpus is pinned to
+# a large real-world source file. Swap book_url for any raw text URL (your
+# own code/YAML/Terraform corpus) to benchmark your workload mix.
+#
+# Two measurement caveats from upstream (2026-07-29/31), both matter here:
+#   * WARM UP FIRST: the first requests after boot — or after ~30 min idle —
+#     run ~30% slow (58 vs 83 tok/s upstream), and the boot log looks ready.
+#     Send a few 500+-token generations before trusting any number.
+#   * If you measure by hand: use stream:false and usage.completion_tokens.
+#     Under spec decode vLLM emits one SSE chunk per decode STEP (carrying
+#     all accepted tokens), so counting stream deltas measures steps/s and
+#     under-reports by the acceptance length (14.7 vs 60.1 on the same
+#     request). llama-benchy counts tokens, not chunks — it is not affected.
+benchmark:
+  framework: llama-benchy
+  timeout: 7200
+  # Default matrix is sized to finish in ~15 min. Deep-context cells are
+  # enormously expensive (every stream prefills its own fresh 32K/131K slice
+  # per run at ~2.6K tok/s prefill): a full depth-131072 x high-concurrency
+  # sweep takes hours. Run heavy cells explicitly when needed, e.g.:
+  #   -b depth=131072 -b concurrency=1     (~5 min: decode-at-depth check)
+  #   -b depth=131072 -b concurrency=6     (hours: worst-case prefill storm)
+  args:
+    pp: [2048]
+    tg: [128]
+    depth: [0, 32768]
+    concurrency: [1, 2, 6]
+    runs: 2
+    # Corpus A (default): hard real-world code — TypeScript compiler internals.
+    # Lower draft acceptance, the conservative coding number.
+    book_url: https://raw.githubusercontent.com/microsoft/TypeScript/v5.5.4/src/compiler/checker.ts
+    # Corpus B (A/B alternate): boilerplate-heavy HTML — the WHATWG HTML spec
+    # source (7.9 MB of repetitive markup, pinned commit). High-redundancy text
+    # -> higher draft acceptance -> upper-bound decode speed. Switch per run:
+    #   -b book_url=https://raw.githubusercontent.com/whatwg/html/88ae68cb961651f0f92c5d2046049f53ecdfc6cf/source
+    # llama-benchy caches each corpus by URL hash (~/.cache/llama-benchy), so
+    # switching back and forth costs nothing after the first download.
+    # Must be here, not only in defaults: sparkrun v0.2.40 builds the per-task
+    # benchmark commands BEFORE it injects served_model_name from the config
+    # chain (ordering bug), so llama-benchy would otherwise request the HF ID
+    # and get a 404 from the alias-served endpoint.
+    served_model_name: deepseek-v4-flash-0731
+
+env:
+  # Line-buffer python output even when redirected to the serve log —
+  # without this, a hard crash during startup loses the buffered output
+  # and the failure log is empty.
+  PYTHONUNBUFFERED: "1"
+  # --- core runtime (mirrors upstream docker-compose.dspark.yml) ---
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_TRITON_MLA_SPARSE: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_SKIP_INIT_MEMORY_CHECK: "1"
+  VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
+  HF_HUB_DISABLE_XET: "1"
+  # FlashInfer sampler is part of the 2026-07-03 DSpark garble fix.
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  # --- B12X: =1 is essential; =0 measured worse, then crashed ---
+  VLLM_USE_B12X_MOE: "1"
+  VLLM_USE_B12X_WO_PROJECTION: "1"
+  VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "0"
+  VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: "16"
+  B12X_W4A16_TC_DECODE: "0"
+  # --- DSpark speculative-decoding switches (upstream validated set) ---
+  VLLM_DSPARK_CONFIDENCE_THRESHOLD: "0.0"
+  VLLM_DSPARK_CONFIDENCE_SCHEDULER: "off"
+  VLLM_DSPARK_LOCAL_ARGMAX: "1"
+  VLLM_DSPARK_REPLICATE_MARKOV_W1: "1"
+  VLLM_DSPARK_FUSED_MARKOV_ARGMAX: "0"
+  # =1 also activates the proposer's native ragged-batch path (mixed
+  # prefill/decode under chunked prefill) — the in-tree successor to the
+  # old skip-speculation guard.
+  VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK: "1"
+  VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT: "0"
+  VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP: "1"
+  VLLM_DSV4_B12X_COMPRESSED_MLA: "0"
+  VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE: "0"
+  VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT: "0"
+  # Long-context crash fix kill-switch: clamp stale DSpark draft-KV slot ids.
+  DSPARK_SLOT_CLAMP: "1"
+  # --- toolchain / JIT (GB10 is sm_121; arch list per upstream) ---
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: /opt/env/bin/nvcc
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- NCCL extras not covered by sparkrun's per-host IB auto-detection ---
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_NVLS_ENABLE: "0"
+
+executor_config:
+  shm_size: 64gb
+
+# Reproduce tonyd2wild's `vllm-dspark-runtime:dspark-nvfp4-stage-c` image
+# inside every container before serving:
+#   1. fetch the pinned upstream repo tarball
+#   2. apply the base DSpark overlay (== the whole recipe/overlay/vllm tree;
+#      carries Patch 3, Patch 4 and the native concurrency fix — see header)
+#   3. run the nvfp4 stage A/B/C anchor patches embedded in the stage
+#      Dockerfiles (fail-fast if an anchor is missing)
+#   4. verify Patch 3 + Patch 4 landed (same checks as upstream's
+#      check-patch3.sh preflight) and that everything still compiles
+pre_exec:
+  # The bjk110 image ships no standalone `kill` binary (no procps), but
+  # sparkrun's serve health check runs `docker exec <c> kill -0 <pid>`,
+  # which needs one — without it the check false-negatives ("Serve process
+  # exited immediately") while the server is actually fine. Install a
+  # wrapper that delegates to the bash builtin.
+  - |
+    if [ ! -x /usr/bin/kill ] && [ ! -x /bin/kill ] && [ ! -x /usr/local/bin/kill ]; then
+      printf '#!/bin/bash\nbuiltin kill "$@"\n' > /usr/local/bin/kill
+      chmod +x /usr/local/bin/kill
+      echo "[dspark-overlay] installed /usr/local/bin/kill shim (image has no kill binary)"
+    fi
+  - |
+    set -eu
+    VLLM_ROOT=/opt/env/lib/python3.12/site-packages/vllm
+    SRC=/tmp/dspark-overlay-src
+    COMMIT=d728faee9f5a8d5ebafe7bc44bca6c5d8d0d192f
+    if [ -e "$VLLM_ROOT/.sparkrun-dspark-overlay-$COMMIT" ]; then
+      echo "[dspark-overlay] already applied, skipping"
+      exit 0
+    fi
+    echo "[dspark-overlay] fetching tonyd2wild recipe @ $COMMIT"
+    rm -rf "$SRC" /tmp/dspark-overlay.tar.gz
+    mkdir -p "$SRC"
+    /opt/env/bin/python -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+      "https://codeload.github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark/tar.gz/$COMMIT" \
+      /tmp/dspark-overlay.tar.gz
+    tar -xzf /tmp/dspark-overlay.tar.gz -C "$SRC" --strip-components=1
+    echo "[dspark-overlay] applying base DSpark overlay files"
+    cp -a "$SRC/recipe/overlay/vllm/." "$VLLM_ROOT/"
+    for stage in a b c; do
+      echo "[dspark-overlay] applying nvfp4 stage-$stage patch"
+      sed -n "/<<'PY'/,/^PY$/p" "$SRC/recipe/nvfp4/Dockerfile.stage-$stage" | sed '1d;$d' | /opt/env/bin/python -
+    done
+    # NOTE: upstream's apply-nonuniform-guard.py is intentionally NOT run.
+    # It exists for foreign prebuilt images whose proposer lacks the
+    # concurrency fix; this overlay's proposer handles non-uniform batches
+    # natively, and stacking the guard on top of it short-circuits that path
+    # into always-rejected dummy drafts ("Drafted: N, Accepted: 0").
+    echo "[dspark-overlay] verifying Patch 3 (cold-prefill garble fix) is present"
+    grep -q "is_prefill_chunk" "$VLLM_ROOT/v1/core/sched/scheduler.py" \
+      || { echo "[dspark-overlay] FATAL: Patch 3 missing — cold prefills would garble"; exit 1; }
+    echo "[dspark-overlay] verifying Patch 4 (draft shared-expert loader fix) is present"
+    grep -q "shared_experts.gate_up_proj" "$VLLM_ROOT/v1/spec_decode/dspark.py" \
+      || { echo "[dspark-overlay] FATAL: Patch 4 missing — 0731 would run at half speed"; exit 1; }
+    find "$VLLM_ROOT" -name __pycache__ -type d -prune -exec rm -rf {} + || true
+    /opt/env/bin/python -m py_compile "$VLLM_ROOT/envs.py" "$VLLM_ROOT/v1/core/sched/scheduler.py" "$VLLM_ROOT/v1/spec_decode/dspark.py" "$VLLM_ROOT/v1/spec_decode/dspark_proposer.py"
+    touch "$VLLM_ROOT/.sparkrun-dspark-overlay-$COMMIT"
+    echo "[dspark-overlay] done: runtime now equivalent to vllm-dspark-runtime:dspark-nvfp4-stage-c @ $COMMIT"
+
+# NOTE: no post_exec speed-test hook here, on purpose. sparkrun v0.2.40
+# runs post hooks BEFORE it starts following logs, gated on a hardcoded
+# 4-minute port-readiness timeout (wait_for_port: 120 x 2s) — this model
+# needs ~5-6 min to open the port, so any recipe post hook makes the
+# launch error out with "Server port never became ready" while the
+# cluster actually boots fine in the background. Use the standalone
+# ./speedtest-starfall.sh against the running server instead.
+
+# Mirrors the upstream compose launcher. sparkrun's vllm-distributed runtime
+# appends --nnodes / --node-rank / --master-addr / --master-port (+ --headless
+# on the worker) automatically; NCCL_IB_HCA / NCCL_SOCKET_IFNAME / GID are
+# injected per host by sparkrun's InfiniBand auto-detection.
+# Notes:
+#   * --generation-config vllm and NO --override-generation-config is part
+#     of the garble fix (explicit client request params still win).
+#   * --max-cudagraph-capture-size is deliberately absent — vLLM derives
+#     max_num_seqs x (k+1); a stale literal silently truncates capture.
+command: |
+  export PATH=/opt/env/bin:/opt/env/nvvm/bin:/opt/env/targets/sbsa-linux/nvvm/bin:$PATH &&
+  export CUDA_HOME=/opt/env/targets/sbsa-linux CUDA_PATH=/opt/env/targets/sbsa-linux CUDAToolkit_ROOT=/opt/env/targets/sbsa-linux &&
+  export LD_LIBRARY_PATH=/opt/env/lib:/opt/env/targets/sbsa-linux/lib:$LD_LIBRARY_PATH &&
+  /opt/env/bin/vllm serve {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --block-size {block_size} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --async-scheduling \
+    --enable-chunked-prefill \
+    --speculative-config '{speculative_config}' \
+    --tokenizer-mode {tokenizer_mode} \
+    --distributed-executor-backend mp \
+    --tool-call-parser {tool_call_parser} \
+    --enable-auto-tool-choice \
+    --reasoning-parser {reasoning_parser} \
+    --reasoning-config '{reasoning_config}' \
+    --default-chat-template-kwargs '{chat_template_kwargs}' \
+    --generation-config vllm \
+    --enable-flashinfer-autotune
