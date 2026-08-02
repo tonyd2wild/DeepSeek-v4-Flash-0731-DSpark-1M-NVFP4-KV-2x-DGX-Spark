@@ -26,6 +26,10 @@ set +a
 : "${VLLM_HOST_IP:?VLLM_HOST_IP must be set to the head node fabric IP in $ENV_FILE}"
 : "${WORKER_VLLM_HOST_IP:?WORKER_VLLM_HOST_IP must be set to the worker node fabric IP in $ENV_FILE}"
 
+if [ "${SKIP_CONFIG_VALIDATION:-0}" != "1" ]; then
+  "$SCRIPT_DIR/validate-dspark-config.sh"
+fi
+
 cd "$SCRIPT_DIR"
 
 # DSpark source patches ship inside the runtime image (recipe/overlay/), not
@@ -73,8 +77,15 @@ ssh "$WORKER_HOST" "$REMOTE_COMPOSE NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_
 echo "Starting DSpark head..."
 COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=0 HEADLESS= docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
 
+echo "Both ranks have been started. Run this launcher only on the head node."
+echo "A cold start can spend several minutes loading weights and compiling/capturing kernels."
+echo "Rank 0 may pause at 'world_size=2 ... distributed_init_method=...' while rank 1 joins; this is expected."
+echo "For recent logs from both nodes, run in another head-node terminal:"
+echo "  $SCRIPT_DIR/logs-deepseek-v4-flash-dspark.sh"
+echo "The readiness wait below allows up to $((WAIT_ATTEMPTS * WAIT_SECONDS)) seconds."
+
 echo "Waiting for DSpark vLLM API..."
-for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
+for attempt in $(seq 1 "$WAIT_ATTEMPTS"); do
   if curl -fsS --max-time 5 "$API_URL" >/dev/null; then
     echo "DeepSeek V4 Flash DSpark is running: $API_URL"
     COMPOSE_DISABLE_ENV_FILE=1 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
@@ -85,6 +96,9 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
       -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":8,"temperature":0.0}' >/dev/null
     echo "Minimal chat request succeeded."
     exit 0
+  fi
+  if ((attempt % 4 == 0)); then
+    echo "Still waiting for the API ($((attempt * WAIT_SECONDS)) seconds elapsed)..."
   fi
   sleep "$WAIT_SECONDS"
 done

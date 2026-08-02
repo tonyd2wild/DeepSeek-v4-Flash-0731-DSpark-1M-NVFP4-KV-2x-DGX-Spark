@@ -176,7 +176,10 @@ acceptance problem: check Patch 4 before anything else.
 
 ## Quick start
 
-Run from the head node.
+Run every command in this section **once, on the head node only**. The launch
+script connects to `WORKER_HOST` over SSH, copies the deployment files, starts
+rank 1 on the worker first, and then starts rank 0 locally. Do not run the
+launch script separately on both nodes.
 
 ```bash
 cp .env.dspark.example .env.dspark
@@ -194,12 +197,33 @@ Edit these values for your cluster:
 - `WORKER_HF_CACHE` if the worker cache path differs from the head
 - `VLLM_HOST_IP` and `WORKER_VLLM_HOST_IP` for each node's fabric IP
 
-Then build, prepare the cache, and start (worker-first):
+The editable values are different kinds of identifiers; do not substitute the
+management Ethernet address where a RoCE address is required:
+
+| variable | expected value | verified topology example |
+|---|---|---|
+| `WORKER_HOST` | SSH target for the worker | `tonyspark4@192.168.192.4` |
+| `MASTER_ADDR` | head-node **RoCE fabric IPv4 address** | `192.168.192.3` |
+| `NCCL_IB_HCA` | RDMA/HCA device name | `rocep1s0f0` |
+| `NCCL_SOCKET_IFNAME` | Linux network interface associated with that fabric | `enp1s0f0np0` |
+| `NCCL_IB_GID_INDEX` | decimal GID-table index, not an address or interface | `3` |
+| `HF_CACHE` | absolute head-node cache path | `/home/tonyspark3/.cache/huggingface` |
+| `WORKER_HF_CACHE` | absolute worker cache path | `/home/tonyspark4/.cache/huggingface` |
+| `VLLM_HOST_IP` | head-node RoCE fabric IPv4 address | `192.168.192.3` |
+| `WORKER_VLLM_HOST_IP` | worker-node RoCE fabric IPv4 address | `192.168.192.4` |
+
+These are real values from the verified 2026-07-04 deployment, not addresses
+that should be copied onto another network. The current known-working runtime
+values are already populated in `.env.dspark.example`; only the cluster,
+fabric, and path placeholders need site-specific edits.
+
+Validate the edited file, then build, prepare the cache, and start:
 
 ```bash
-./build-dspark-vllm-runtime.sh      # builds the base overlay + Stage C NVFP4 image
-./prepare-dspark-model-cache.sh     # downloads/verifies the model cache
-./start-deepseek-v4-flash-dspark.sh # worker-first launch and smoke test
+./validate-dspark-config.sh          # rejects placeholders/types and renders compose
+./build-dspark-vllm-runtime.sh       # builds locally and on the worker
+./prepare-dspark-model-cache.sh      # downloads locally and mirrors to the worker
+./start-deepseek-v4-flash-dspark.sh  # starts worker, then head; waits for API + smoke
 ```
 
 The API serves at:
@@ -223,7 +247,7 @@ Keep these `.env.dspark` values unless you are deliberately experimenting:
 - `MAX_MODEL_LEN=1048576` — **1M, the model's true YaRN ceiling** (see the note above)
 - `MAX_NUM_SEQS=12`
 - `GPU_MEMORY_UTILIZATION=0.85`
-- `MTP_NUM_TOKENS=3` (with `draft_sample_method=probabilistic`; see the [garble fix](#garble-fix-2026-07-03))
+- `MTP_NUM_TOKENS=5` — the verified Patch-3 default
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_USE_B12X_WO_PROJECTION=1`
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
@@ -274,6 +298,8 @@ Keep these `.env.dspark` values unless you are deliberately experimenting:
 ./start-deepseek-v4-flash-dspark.sh
 ```
 
+Run this command **once on the head node**. It launches rank 1 through SSH
+before launching rank 0 locally; you do not run it again on the worker.
 Worker-first startup avoids a race during multi-node `mp` initialization. The
 launcher runs `--generation-config vllm` with **no** `--override-generation-config`
 and `--default-chat-template-kwargs '{"thinking":false}'`. Exact flags and env
@@ -285,32 +311,44 @@ Other lifecycle scripts: `stop-deepseek-v4-flash-dspark.sh`,
 `smoke-deepseek-v4-flash-dspark.sh`, `validate-dspark-config.sh`,
 `update-and-restart.sh`.
 
-### Verify
+### Verify and understand startup
 
-After launch:
+`start-deepseek-v4-flash-dspark.sh` waits for the API and runs a smoke request.
+A cold boot can take several minutes for model loading, compilation, CUDA-graph
+capture, and first-use kernel/JIT caching. In a second terminal on the **head
+node**, inspect both nodes without maintaining two SSH sessions:
+
+```bash
+./status-deepseek-v4-flash-dspark.sh
+./logs-deepseek-v4-flash-dspark.sh
+```
+
+The log helper returns a recent snapshot from both rank 0 and rank 1. By
+contrast, this manual command follows **rank 0 only** and intentionally does
+not return until you press Ctrl-C:
+
+```bash
+docker compose --env-file .env.dspark -f docker-compose.dspark.yml \
+  logs -f vllm-dspark
+```
+
+Run that manual `logs -f` command separately on the worker only if you want a
+second live follower. A final-looking line such as:
+
+```text
+world_size=2 rank=0 local_rank=0 distributed_init_method=tcp://HEAD_ROCE_IP:MASTER_PORT
+```
+
+usually means rank 0 is waiting for rank 1 to join NCCL; it is not a completion
+message and `logs -f` itself is not hung. If it does not advance after several
+minutes, use the two helper scripts above and verify that the worker container
+is running and both ranks agree on `MASTER_ADDR`, `MASTER_PORT`, HCA, socket
+interface, and GID index.
+
+After launch, the current default should report `max_model_len: 1048576`:
 
 ```bash
 curl -fsS http://127.0.0.1:8888/v1/models
-```
-
-Confirm the returned model entry reports (C12 1.5M checkpoint):
-
-```json
-"max_model_len": 1500000
-```
-
-Then check logs:
-
-```bash
-docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dspark \
-  | grep -E "GPU KV cache size|Maximum concurrency"
-```
-
-Expected C12 checkpoint values are around:
-
-```text
-GPU KV cache size: 3.2M tokens
-Maximum concurrency for 1,500,000 tokens per request: 2.1x
 ```
 
 Before pointing an agent harness at the endpoint, run the direct sanity bench:
@@ -1071,7 +1109,7 @@ recipe.
 | `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; honors worker path/cache/IP overrides |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
 | `status-deepseek-v4-flash-dspark.sh` | shows head/worker container state |
-| `logs-deepseek-v4-flash-dspark.sh` | tails head/worker DSpark logs |
+| `logs-deepseek-v4-flash-dspark.sh` | shows recent rank-0 and rank-1 logs when run on the head |
 | `smoke-deepseek-v4-flash-dspark.sh` | direct concurrent OpenAI-compatible smoke test |
 | `validate-dspark-config.sh` | renders and checks the local DSpark compose/env config |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
