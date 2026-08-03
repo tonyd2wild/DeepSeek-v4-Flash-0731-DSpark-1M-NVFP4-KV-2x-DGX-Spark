@@ -28,9 +28,27 @@ def make_prompt(i: int) -> str:
     )
 
 
+def is_empty(text: str) -> bool:
+    """Soft-empty completion: tokens were generated but nothing is visible.
+
+    This is a real, silent failure mode. With thinking enabled the model opens a
+    <think> block; if max_tokens runs out before </think>, the reasoning parser
+    emits NEITHER content NOR reasoning_content and the caller gets "" while the
+    whole budget was spent. Measured here at temperature 0.5, thinking on:
+    max_tokens 256 -> 83% empty, 512 -> 50%, 768 -> 17%, 1024 -> 0/18.
+
+    It must be checked separately from looks_bad(): empty text contains no CJK,
+    no repeats and no leaked markup, so it passes every other check trivially and
+    the gate reports success on a server that answers nothing.
+    """
+    return not text.strip()
+
+
 def looks_bad(text: str) -> bool:
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     repeated = any(ch * 18 in text for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    # <think> only counts as leakage when the reasoning parser should have
+    # stripped it; a correctly parsed thinking response never carries it.
     leaked = any(marker in text.lower() for marker in ("<available_skills", "<tool", "</tool", "<think>"))
     return cjk > 0 or repeated or leaked
 
@@ -61,6 +79,8 @@ def request_one(i: int) -> dict:
         "tok_s": round(completion / dt, 2) if dt else 0,
         "finish_reason": data["choices"][0].get("finish_reason"),
         "bad_output": looks_bad(content),
+        "empty_output": is_empty(content),
+        "reasoning_chars": len(data["choices"][0]["message"].get("reasoning_content") or ""),
         "sample": content[:200],
     }
 
@@ -73,13 +93,14 @@ def run(concurrency: int) -> dict:
     total = sum(r["completion_tokens"] for r in rows)
     return {
         "concurrency": concurrency,
-        "success": f"{sum(not r['bad_output'] for r in rows)}/{len(rows)}",
+        "success": f"{sum(not (r['bad_output'] or r['empty_output']) for r in rows)}/{len(rows)}",
         "max_tokens": MAX_TOKENS,
         "wall_seconds": round(wall, 3),
         "completion_tokens": total,
         "aggregate_tok_s": round(total / wall, 2) if wall else 0,
         "per_request_tok_s_mean": round(statistics.mean(r["tok_s"] for r in rows), 2),
         "bad_outputs": sum(1 for r in rows if r["bad_output"]),
+        "empty_outputs": sum(1 for r in rows if r["empty_output"]),
         "rows": rows,
     }
 
@@ -89,7 +110,16 @@ def main() -> int:
     for concurrency in CONCURRENCY_LIST:
         result = run(concurrency)
         print(json.dumps(result, indent=2))
-        failed = failed or result["bad_outputs"] > 0
+        if result["empty_outputs"]:
+            print(
+                f"FAIL: {result['empty_outputs']}/{len(result['rows'])} responses at "
+                f"concurrency {result['concurrency']} had empty visible content while "
+                f"consuming their token budget. With thinking enabled this means "
+                f"MAX_TOKENS={MAX_TOKENS} is too small to reach </think>; raise it "
+                f"(>=1024 measured clean) or disable thinking.",
+                file=sys.stderr,
+            )
+        failed = failed or result["bad_outputs"] > 0 or result["empty_outputs"] > 0
     return 1 if failed else 0
 
 

@@ -4,8 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.dspark}"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.dspark.yml}"
-API_URL="${API_URL:-http://127.0.0.1:8888/v1/models}"
-CHAT_URL="${CHAT_URL:-http://127.0.0.1:8888/v1/chat/completions}"
 WAIT_ATTEMPTS="${WAIT_ATTEMPTS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-15}"
 
@@ -18,6 +16,13 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+# Derive the health-check URLs AFTER sourcing, so VLLM_PORT actually reaches them.
+# Setting these before the source pinned them to 8888 regardless of VLLM_PORT, so a
+# non-default port started the server correctly and then timed out waiting on 8888.
+# An explicit API_URL/CHAT_URL from the environment still wins.
+API_URL="${API_URL:-http://127.0.0.1:${VLLM_PORT:-8888}/v1/models}"
+CHAT_URL="${CHAT_URL:-http://127.0.0.1:${VLLM_PORT:-8888}/v1/chat/completions}"
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"

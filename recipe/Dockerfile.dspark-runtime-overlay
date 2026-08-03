@@ -25,6 +25,21 @@ COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/env/lib/python3.12/s
 COPY vllm/v1/spec_decode/dspark.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py
 COPY vllm/v1/spec_decode/dspark_proposer.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py
 COPY vllm/v1/worker/gpu_model_runner.py /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
+# reasoning_effort three-level fix: the stock build shipped a single constant named
+# REASONING_EFFORT_MAX that is byte-identical to upstream's *high* text, and a
+# normaliser that mapped everything except max/xhigh to "high". Net effect: "high"
+# injected nothing, "low" did not exist, and upstream's real "max" was unreachable.
+# These two files restore the three levels using DeepSeek's own strings.
+COPY vllm/tokenizers/deepseek_v4.py /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4.py
+COPY vllm/tokenizers/deepseek_v4_encoding.py /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4_encoding.py
+# Streaming tool-parser fix: the stock parser passes an explicit empty
+# `tool_calls=[]` on every content delta once a request carries tools. With
+# exclude_unset=True serialisation that emits `"tool_calls": []`, which is not
+# part of the OpenAI wire format and is truthy in JavaScript — agent clients
+# route the text into the tool-call branch and show no answer at all.
+# The deepseek_v4 tool parser is a thin subclass of this one, so patching here
+# fixes both. See docs and the VS Code reproduction in the repo history.
+COPY vllm/tool_parsers/deepseekv32_tool_parser.py /opt/env/lib/python3.12/site-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
 
 RUN /opt/env/bin/python -m py_compile \
     /opt/env/lib/python3.12/site-packages/vllm/envs.py \
@@ -38,4 +53,7 @@ RUN /opt/env/bin/python -m py_compile \
     /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py \
-    /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
+    /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py \
+    /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4.py \
+    /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4_encoding.py \
+    /opt/env/lib/python3.12/site-packages/vllm/tool_parsers/deepseekv32_tool_parser.py

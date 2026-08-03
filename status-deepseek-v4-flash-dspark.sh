@@ -6,15 +6,16 @@ ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.dspark}"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.dspark.yml}"
 PROJECT_NAME="${PROJECT_NAME:-deepseek-v4-flash}"
 LEGACY_PROJECT_NAME="${LEGACY_PROJECT_NAME:-$(basename "$SCRIPT_DIR" | tr '[:upper:]' '[:lower:]')}"
-API_URL="${API_URL:-http://127.0.0.1:8888/v1/models}"
-PORT="${PORT:-8888}"
-
 if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
 fi
+
+# Derived after the source so VLLM_PORT reaches them; explicit overrides still win.
+API_URL="${API_URL:-http://127.0.0.1:${VLLM_PORT:-8888}/v1/models}"
+PORT="${PORT:-${VLLM_PORT:-8888}}"
 
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE or environment}"
 : "${DSPARK_VLLM_IMAGE:=vllm-dspark-runtime:dspark-nvfp4-stage-c}"

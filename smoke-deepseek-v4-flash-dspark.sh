@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.dspark}"
-CHAT_URL="${CHAT_URL:-http://127.0.0.1:8888/v1/chat/completions}"
 CONCURRENCY="${CONCURRENCY:-6}"
 MAX_TOKENS="${MAX_TOKENS:-32}"
 
@@ -13,6 +12,9 @@ if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
   set +a
 fi
+
+# Derived after the source so VLLM_PORT reaches it; an explicit override still wins.
+CHAT_URL="${CHAT_URL:-http://127.0.0.1:${VLLM_PORT:-8888}/v1/chat/completions}"
 
 MODEL="${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
 tmpdir="$(mktemp -d)"
