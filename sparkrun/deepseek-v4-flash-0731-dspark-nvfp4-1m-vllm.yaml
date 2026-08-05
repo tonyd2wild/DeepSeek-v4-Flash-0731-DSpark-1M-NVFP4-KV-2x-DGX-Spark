@@ -165,6 +165,9 @@ env:
   # and the failure log is empty.
   PYTHONUNBUFFERED: "1"
   # --- core runtime (mirrors upstream docker-compose.dspark.yml) ---
+  # Second-startup stability: engine-ready timeout defaults to 600 s, which
+  # trips torch.distributed teardown during warm restarts of this model.
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
   VLLM_TRITON_MLA_SPARSE: "1"
   VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
