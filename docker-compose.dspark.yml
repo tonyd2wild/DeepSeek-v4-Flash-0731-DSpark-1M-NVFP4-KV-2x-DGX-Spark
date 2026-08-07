@@ -71,6 +71,16 @@ services:
       NCCL_IB_DISABLE: "${NCCL_IB_DISABLE:-0}"
       NCCL_IB_HCA: "${NCCL_IB_HCA}"
       NCCL_SOCKET_IFNAME: "${NCCL_SOCKET_IFNAME}"
+      # NCCL_SOCKET_IFNAME only steers NCCL. torch.distributed also builds a Gloo
+      # CPU process group, and Gloo does its OWN interface pick: with nothing set it
+      # takes the first non-loopback interface in kernel order. On DGX Spark that is
+      # enP7s7 (the 10GbE port), which is typically unplugged and carries no address,
+      # so engine init dies with:
+      #   RuntimeError: [gloo/transport/tcp/device.cc:84] ifa != nullptr.
+      #   Unable to find address for: enP7s7
+      # Pin both to the fabric interface. TP_SOCKET_IFNAME covers the TCPStore path.
+      GLOO_SOCKET_IFNAME: "${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
+      TP_SOCKET_IFNAME: "${TP_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
       NCCL_IB_GID_INDEX: "${NCCL_IB_GID_INDEX:-}"
       NCCL_CROSS_NIC: "${NCCL_CROSS_NIC:-1}"
       NCCL_CUMEM_ENABLE: "${NCCL_CUMEM_ENABLE:-0}"
@@ -84,6 +94,17 @@ services:
       MASTER_PORT: "${MASTER_PORT:-25000}"
       MTP_NUM_TOKENS: "${MTP_NUM_TOKENS:-5}"
 
+      # Server-side chat/sampling defaults. Both are optional; empty keeps the
+      # historical behaviour ('{"thinking":false}' and no generation override).
+      # NOTE on OVERRIDE_GENERATION_CONFIG: with --generation-config vllm the base
+      # dict is EMPTY and only these keys are applied (config/model.py:1482-1485),
+      # so whatever you put here is the complete default set. Never put
+      # repetition_penalty in it — that is a documented DSpark spec-decode crash
+      # risk (illegal memory access), and it is what got this flag removed in the
+      # 2026-07-03 garble fix. Explicit client request parameters still win.
+      DEFAULT_CHAT_TEMPLATE_KWARGS: "${DEFAULT_CHAT_TEMPLATE_KWARGS:-}"
+      OVERRIDE_GENERATION_CONFIG: "${OVERRIDE_GENERATION_CONFIG:-}"
+
     command:
       - bash
       - -lc
@@ -94,6 +115,11 @@ services:
         export CUDAToolkit_ROOT="$${CUDAToolkit_ROOT:-$${CUDA_HOME}}";
         export LD_LIBRARY_PATH="/opt/env/lib:/opt/env/targets/sbsa-linux/lib:$${LD_LIBRARY_PATH:-}";
         SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"probabilistic\"}";
+        CHAT_TEMPLATE_KWARGS="$${DEFAULT_CHAT_TEMPLATE_KWARGS:-}";
+        [ -n "$${CHAT_TEMPLATE_KWARGS}" ] || CHAT_TEMPLATE_KWARGS='{"thinking":false}';
+        OGC_ARGS=();
+        if [ -n "$${OVERRIDE_GENERATION_CONFIG:-}" ]; then OGC_ARGS=(--override-generation-config "$${OVERRIDE_GENERATION_CONFIG}"); fi;
+        echo "serving with chat-template-kwargs=$${CHAT_TEMPLATE_KWARGS} override-generation-config=$${OVERRIDE_GENERATION_CONFIG:-<none>}";
         exec /opt/env/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
         --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}
         --host ${VLLM_HOST:-127.0.0.1}
@@ -118,8 +144,9 @@ services:
         --enable-auto-tool-choice
         --reasoning-parser deepseek_v4
         --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
-        --default-chat-template-kwargs '{"thinking":false}'
+        --default-chat-template-kwargs "$${CHAT_TEMPLATE_KWARGS}"
         --generation-config vllm
+        "$${OGC_ARGS[@]}"
         --enable-flashinfer-autotune
         --nnodes 2
         --node-rank ${NODE_RANK}
