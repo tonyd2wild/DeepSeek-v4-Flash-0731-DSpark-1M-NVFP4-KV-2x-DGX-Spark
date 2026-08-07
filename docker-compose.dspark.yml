@@ -15,6 +15,17 @@ services:
       - /dev/infiniband:/dev/infiniband
 
     volumes:
+      # Serve weights already on disk instead of downloading through the HF
+      # cache: set LOCAL_MODELS_DIR in .env.dspark (it reaches both nodes, since
+      # the launcher passes the env file to worker and head) and point
+      # DSPARK_MODEL at /models/<dir>. Defaults to the HF cache dir, so leaving
+      # it unset mounts nothing new.
+      #
+      # DSPARK_MODEL must name a real directory inside the mount — a symlink
+      # whose target lies outside it resolves to a host path the container
+      # cannot see, and vLLM then treats the value as an HF repo id
+      # (HFValidationError: Repo id must be in the form ...).
+      - ${LOCAL_MODELS_DIR:-${HF_CACHE:-${HOME}/.cache/huggingface}}:/models:ro
       - ${HF_CACHE:-${HOME}/.cache/huggingface}:/cache/huggingface
       # DSpark source patches are baked into the image from recipe/overlay/
       # (see README "vLLM version note"); do not bind-mount a proposer copy
@@ -71,6 +82,12 @@ services:
       NCCL_IB_DISABLE: "${NCCL_IB_DISABLE:-0}"
       NCCL_IB_HCA: "${NCCL_IB_HCA}"
       NCCL_SOCKET_IFNAME: "${NCCL_SOCKET_IFNAME}"
+      # The base image bakes GLOO_SOCKET_IFNAME/TP_SOCKET_IFNAME for the
+      # author's NIC. On any other host those interfaces do not exist and
+      # rank init dies in ProcessGroupGloo (gloo/transport/tcp/device.cc).
+      # Default to the NCCL interface so a single .env value covers all three.
+      GLOO_SOCKET_IFNAME: "${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
+      TP_SOCKET_IFNAME: "${TP_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
       NCCL_IB_GID_INDEX: "${NCCL_IB_GID_INDEX:-}"
       NCCL_CROSS_NIC: "${NCCL_CROSS_NIC:-1}"
       NCCL_CUMEM_ENABLE: "${NCCL_CUMEM_ENABLE:-0}"
@@ -101,7 +118,7 @@ services:
         --trust-remote-code
         --tensor-parallel-size 2
         --pipeline-parallel-size 1
-        --kv-cache-dtype nvfp4_ds_mla
+        --kv-cache-dtype ${KV_CACHE_DTYPE:-nvfp4_ds_mla}
         --block-size 256
         --max-model-len ${MAX_MODEL_LEN:-1048576}
         --max-num-seqs ${MAX_NUM_SEQS:-6}
