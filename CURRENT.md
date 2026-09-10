@@ -1,4 +1,49 @@
-Both launchers read `MODEL_DIR` (default `DeepSeek-V4-Flash-Vision-Exp`); the uncensored build is the same launcher with `MODEL_DIR=keys-DeepSeekV4Flash-Vision-EXP-ablit`.
+# CURRENT — what this repo actually runs (2026-09-02)
+
+One launcher per topology, at the top level, in [`launchers/`](launchers/). Everything else on
+this repo is reference, history, or a second documented recipe. If a doc and a launcher disagree,
+**the launcher wins**.
+
+---
+
+## DeepSeek-V4-Flash-Vision-Exp, TP2 (two Sparks)
+
+**Launcher:** [`launchers/ds4-vision-tp2.sh <0|1>`](launchers/ds4-vision-tp2.sh)
+
+| rank | node | fabric IP | role |
+|---|---|---|---|
+| 0 | **Asusi** | `192.168.192.3` | head — serves `:8888` |
+| 1 | **Bluey** | `192.168.192.1` | worker (`--headless`) |
+
+**Launch worker first**, then the head:
+
+```bash
+./launchers/ds4-vision-tp2.sh 1     # bluey  (holds the weights, NFS-exports them)
+./launchers/ds4-vision-tp2.sh 0     # asusi  (head, serves :8888)
+```
+
+**Recipe:**
+
+- **Served model id:** `deepseek-v4-flash-dspark` (not `...-vision-exp` — the vision build is a
+  drop-in on the same endpoint, so agents wired to the text id do not get rewired).
+- **DSpark speculative decoding:** `k=5`, `draft_sample_method=probabilistic`.
+- **Patch 3 + Patch 4** bind-mounted from `/var/tmp` **on both nodes**. Patch 4 fails *silently*
+  when it is missing — the draft's always-on shared expert loads uninitialised and decode runs at
+  roughly half speed with perfect-looking output. **Run
+  [`scripts/check-patch4.sh <head-container> <worker-container>`](scripts/check-patch4.sh) before
+  trusting any number.**
+- **KV cache dtype:** `nvfp4_ds_mla`, `--block-size 256`.
+- **Context:** `1048576` (1M). *Changed in this commit:* the launcher previously passed
+  `1500000`; 1M is the model's calibrated YaRN ceiling and is now the standard on both topologies.
+- **`--gpu-memory-utilization 0.85`**, `--max-num-seqs 12`, `--max-cudagraph-capture-size 12`,
+  `--max-num-batched-tokens 8192`.
+- **Image:** `ghcr.io/tonyd2wild/vllm-dspark-runtime:v2026.09.02` — the same digest as the local
+  tag `mia-raf-pr1-nvfp4-probe-c-keys-concurrency-p2b` that the launcher names.
+- **Weights:** on Bluey at `/var/tmp/models/DeepSeek-V4-Flash-Vision-Exp`, exported over NFS
+  (Asusi mounts it at `/mnt/bluey-models`).
+- **Uncensored variant:** set `MODEL_DIR=keys-DeepSeekV4Flash-Vision-EXP-ablit`. Drop-in — same
+  shards, same format, same tokenizer. Both launchers read `MODEL_DIR` (default
+  `DeepSeek-V4-Flash-Vision-Exp`); the uncensored build is the same launcher with that one variable set.
 
 **Expected (TP2):**
 
@@ -41,9 +86,9 @@ Both launchers read `MODEL_DIR` (default `DeepSeek-V4-Flash-Vision-Exp`); the un
 `--gpu-memory-utilization 0.85`, `--max-model-len 1048576`. Differences from TP2:
 `--tensor-parallel-size 4`, `--nnodes 4`, **`--max-num-seqs 64`**, and
 **`--max-cudagraph-capture-size 64`** (the workspace copy of this launcher still said 12/12; the
-validated run used 64/64). CUDA graphs are on: `--enforce-eager` is not passed, `--max-cudagraph-capture-size 64` is, and the head log shows `Graph capturing finished in 10 secs, took 0.68 GiB`; the mode is vLLM's default for this image, not pinned by the launcher. Note: the launcher
-not set a cudagraph-mode env var, so this is the runtime's own default on this image rather than
-something we pin.
+validated run used 64/64). CUDA graphs are on: `--enforce-eager` is not passed,
+`--max-cudagraph-capture-size 64` is, and the head log shows `Graph capturing finished in 10 secs,
+took 0.68 GiB`; the mode is vLLM's default for this image, not pinned by the launcher.
 
 **Expected (measured 2026-09-02, TP4):**
 
