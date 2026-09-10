@@ -2,7 +2,7 @@
 #
 # sparkrun port of:
 #   https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark
-# (pinned to commit d728faee9f5a8d5ebafe7bc44bca6c5d8d0d192f, 2026-07-31)
+# (pinned to commit f45efabb97da61092dcc07e187ef2c8a01245a67, 2026-08-13)
 #
 # This is the recipe for DeepSeek's OFFICIAL `DeepSeek-V4-Flash-0731` release,
 # contributed via issue #9. See sparkrun/README.md for quick start and
@@ -25,6 +25,10 @@
 #     0731 measured 25.7% -> 60.2% acceptance, 32.7 -> 55.4 mean tok/s
 #     with the fix. On 0731 this patch is THE difference between "half
 #     speed" and the advertised numbers.
+#   * Patch 6 (local scheduler-queue lifetime fix, issue #26). WorkerProc
+#     attaches to its local POSIX SHM reader before the 155 GiB model load
+#     and reuses that live mapping afterwards, so an unlinked name cannot
+#     turn a successful load into a first-dequeue crash.
 #   * native non-uniform-batch handling in the proposer (concurrency>=2
 #     crash fix). NOTE: upstream's apply-nonuniform-guard.py is deliberately
 #     NOT run here — it is for foreign prebuilt images only. Stacking it on
@@ -230,11 +234,10 @@ executor_config:
 # inside every container before serving:
 #   1. fetch the pinned upstream repo tarball
 #   2. apply the base DSpark overlay (== the whole recipe/overlay/vllm tree;
-#      carries Patch 3, Patch 4 and the native concurrency fix — see header)
+#      carries Patch 3, Patch 4, Patch 6 and the native concurrency fix)
 #   3. run the nvfp4 stage A/B/C anchor patches embedded in the stage
 #      Dockerfiles (fail-fast if an anchor is missing)
-#   4. verify Patch 3 + Patch 4 landed (same checks as upstream's
-#      check-patch3.sh preflight) and that everything still compiles
+#   4. verify Patches 3, 4 and 6 landed and that everything still compiles
 pre_exec:
   # The bjk110 image ships no standalone `kill` binary (no procps), but
   # sparkrun's serve health check runs `docker exec <c> kill -0 <pid>`,
@@ -251,7 +254,7 @@ pre_exec:
     set -eu
     VLLM_ROOT=/opt/env/lib/python3.12/site-packages/vllm
     SRC=/tmp/dspark-overlay-src
-    COMMIT=d728faee9f5a8d5ebafe7bc44bca6c5d8d0d192f
+    COMMIT=f45efabb97da61092dcc07e187ef2c8a01245a67
     if [ -e "$VLLM_ROOT/.sparkrun-dspark-overlay-$COMMIT" ]; then
       echo "[dspark-overlay] already applied, skipping"
       exit 0
@@ -280,8 +283,13 @@ pre_exec:
     echo "[dspark-overlay] verifying Patch 4 (draft shared-expert loader fix) is present"
     grep -q "shared_experts.gate_up_proj" "$VLLM_ROOT/v1/spec_decode/dspark.py" \
       || { echo "[dspark-overlay] FATAL: Patch 4 missing — 0731 would run at half speed"; exit 1; }
+    echo "[dspark-overlay] verifying Patch 6 (early local MessageQueue attachment) is present"
+    grep -q "preopen_from_handle" "$VLLM_ROOT/v1/executor/multiproc_executor.py" \
+      || { echo "[dspark-overlay] FATAL: Patch 6 WorkerProc pre-open missing"; exit 1; }
+    grep -q "reader_rank=rank" "$VLLM_ROOT/distributed/device_communicators/shm_broadcast.py" \
+      || { echo "[dspark-overlay] FATAL: Patch 6 SHM diagnostic missing"; exit 1; }
     find "$VLLM_ROOT" -name __pycache__ -type d -prune -exec rm -rf {} + || true
-    /opt/env/bin/python -m py_compile "$VLLM_ROOT/envs.py" "$VLLM_ROOT/v1/core/sched/scheduler.py" "$VLLM_ROOT/v1/spec_decode/dspark.py" "$VLLM_ROOT/v1/spec_decode/dspark_proposer.py"
+    /opt/env/bin/python -m py_compile "$VLLM_ROOT/envs.py" "$VLLM_ROOT/distributed/device_communicators/shm_broadcast.py" "$VLLM_ROOT/v1/executor/multiproc_executor.py" "$VLLM_ROOT/v1/core/sched/scheduler.py" "$VLLM_ROOT/v1/spec_decode/dspark.py" "$VLLM_ROOT/v1/spec_decode/dspark_proposer.py"
     touch "$VLLM_ROOT/.sparkrun-dspark-overlay-$COMMIT"
     echo "[dspark-overlay] done: runtime now equivalent to vllm-dspark-runtime:dspark-nvfp4-stage-c @ $COMMIT"
 

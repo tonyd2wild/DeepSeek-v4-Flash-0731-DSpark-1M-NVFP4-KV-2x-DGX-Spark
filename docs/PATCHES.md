@@ -199,3 +199,56 @@ unchanged.
   illegal-memory / IMA crash appears.
 - `draft_sample_method=probabilistic` is a valid tuning option but is **not**
   needed to fix this garble once the scheduler guard is in place.
+
+---
+
+## Patch 6 — preserve the local scheduler queue across long model loads
+
+### Symptom
+
+On the two-node SparkRun profile, replacing the stock checkpoint with the
+documented 155 GiB abliterated drop-in could load all 48 shards and then fail
+before opening the API:
+
+```text
+AttributeError: 'ShmRingBuffer' object has no attribute 'shared_memory'
+```
+
+The later TCPStore and NCCL broken-pipe messages on the peer rank were secondary.
+
+### Root cause
+
+The executor creates its scheduler-output `MessageQueue` before spawning
+`WorkerProc`, but the worker normally opens the local reader only after
+`init_device()` and `load_model()`. During that multi-minute gap, another process
+lifecycle can unlink the queue's POSIX SHM name. The existing mapping remains
+valid in the creator, but a late reader can no longer open the name.
+
+`ShmRingBuffer` also suppressed that `FileNotFoundError`, assuming the object had
+been deserialized on another node. That left a half-constructed object and hid
+the useful failure until its first dequeue.
+
+### Fix
+
+- `WorkerProc.__init__` pre-opens only readers whose rank is local, before worker
+  initialization or model loading.
+- `MessageQueue` caches that live mapping by `(rank, buffer_name)` and the normal
+  post-initialization `create_from_handle()` call consumes and reuses it.
+- Remote readers are unchanged; they still initialize through the distributed
+  process group after `init_device()`.
+- A missing local segment now raises immediately with its SHM name and reader
+  rank.
+- Both vLLM files are copied from `recipe/overlay/` into the base overlay image,
+  so the fix reaches every Stage-C node without a head-only bind mount.
+
+### Validation
+
+The overlay image build includes a CPU-only lifetime regression: attach the local
+reader, unlink the POSIX name, verify the normal late-open path reuses the live
+mapping, then verify a second uncached open fails with the name/rank diagnostic.
+
+Before upstreaming, issue #26's reporter validated the same patch on the affected
+two-node deployment: correct 1M model metadata, a real completion, six concurrent
+completions, and no CUDA, NCCL, EngineDead, or request errors. That live system was
+not reused for PR testing; maintainers should retain their requested two-node
+reproduction gate before merge.

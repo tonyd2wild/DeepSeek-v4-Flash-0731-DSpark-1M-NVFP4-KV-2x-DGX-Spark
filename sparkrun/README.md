@@ -4,9 +4,9 @@ One-command, copy-paste reproducible deployment of this repo's setup via
 [sparkrun](https://github.com/spark-arena/sparkrun). No image build: the
 recipe pulls the public base image (digest-pinned, so it can never silently
 change) and rebuilds the `dspark-nvfp4-stage-c` runtime inside every
-container at start — overlay, stage A/B/C patches, Patch 3 and Patch 4
-included, pinned to commit `d728fae` of this repo. It fail-fast-verifies
-Patch 3 and Patch 4 actually landed before serving, so you can't
+container at start — overlay, stage A/B/C patches, Patches 3, 4 and 6
+included, pinned to commit `f45efab` of this repo. It fail-fast-verifies
+all three actually landed before serving, so you can't
 accidentally run the half-speed stock loader.
 
 Everything here was deployed and measured on a real 2x DGX Spark pair on

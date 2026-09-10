@@ -14,6 +14,13 @@ COPY vllm/model_executor/warmup/kernel_warmup.py /opt/env/lib/python3.12/site-pa
 COPY vllm/model_executor/models/registry.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/models/registry.py
 COPY vllm/v1/outputs.py /opt/env/lib/python3.12/site-packages/vllm/v1/outputs.py
 COPY vllm/v1/core/sched/scheduler.py /opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py
+# A local scheduler MessageQueue is created before WorkerProc loads the model.
+# Open its SHM reader immediately and reuse that live mapping after the load;
+# otherwise a creator-side unlink during a 155 GiB load turns the late attach
+# into a post-load crash. The SHM layer also fails at the missing name/rank
+# instead of leaving a half-initialized ShmRingBuffer (issue #26).
+COPY vllm/distributed/device_communicators/shm_broadcast.py /opt/env/lib/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py
+COPY vllm/v1/executor/multiproc_executor.py /opt/env/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py
 COPY vllm/models/deepseek_v4/__init__.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/__init__.py
 COPY vllm/models/deepseek_v4/nvidia/model.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py
 COPY vllm/models/deepseek_v4/common/ops/cache_utils.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/common/ops/cache_utils.py
@@ -63,6 +70,8 @@ COPY vllm/tool_parsers/deepseekv32_tool_parser.py /opt/env/lib/python3.12/site-p
 
 RUN /opt/env/bin/python -m py_compile \
     /opt/env/lib/python3.12/site-packages/vllm/envs.py \
+    /opt/env/lib/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py \
     /opt/env/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/b12x_moe.py \
     /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py \
     /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/common/ops/cache_utils.py \
@@ -89,6 +98,8 @@ import sys
 
 # (module, attribute that must exist after the overlay)
 CHECKS = [
+    ("vllm.distributed.device_communicators.shm_broadcast", "MessageQueue"),
+    ("vllm.v1.executor.multiproc_executor", "WorkerProc"),
     ("vllm.tool_parsers.deepseekv32_tool_parser", "DeepSeekV32ToolParser"),
     ("vllm.tool_parsers.deepseekv4_tool_parser", "DeepSeekV4ToolParser"),
     ("vllm.tokenizers.deepseek_v4", "DeepseekV4Tokenizer"),
@@ -122,4 +133,43 @@ else:
     print("ok DeepSeekV4ToolParser subclasses DeepSeekV32ToolParser")
 
 sys.exit(1 if failed else 0)
+PY
+
+# CPU-only regression for issue #26. Pre-open the local reader, unlink the
+# POSIX name to reproduce the lifetime window, and prove the normal late-open
+# path reuses the still-live mapping. A second uncached open must fail at the
+# missing name/rank instead of constructing a broken ShmRingBuffer.
+RUN /opt/env/bin/python - <<'PY'
+from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+
+writer = MessageQueue(
+    n_reader=1,
+    n_local_reader=1,
+    max_chunk_bytes=4096,
+    max_chunks=2,
+)
+handle = writer.export_handle()
+assert handle.buffer_handle is not None
+name = handle.buffer_handle[3]
+
+preopened = MessageQueue.preopen_from_handle(handle, rank=0)
+assert preopened is not None
+writer.buffer.shared_memory.unlink()
+# The test owns the unlink; prevent creator cleanup from repeating it.
+writer.buffer.is_creator = False
+
+reused = MessageQueue.create_from_handle(handle, rank=0)
+assert reused is preopened
+assert reused.buffer.shared_memory.buf is not None
+
+try:
+    MessageQueue.create_from_handle(handle, rank=0)
+except FileNotFoundError as exc:
+    diagnostic = str(exc)
+    assert name in diagnostic
+    assert "rank 0" in diagnostic
+else:
+    raise AssertionError("uncached late SHM attachment unexpectedly succeeded")
+
+print("ok local MessageQueue survives unlink through pre-opened mapping")
 PY

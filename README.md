@@ -482,8 +482,9 @@ Keep these `.env.dspark` values unless you are deliberately experimenting:
   bind-mount is needed. As deployed on the pre-Patch-3 `probe-c-p2b` image,
   Patch 3 was injected via bind-mount (see [`DEFAULT-CONFIG.md`](DEFAULT-CONFIG.md)).
 
-> **⚠️ vLLM version note (proposer fixes ship in the image):** all DSpark source
-> patches — including the concurrency-crash fix — are baked into the runtime image
+> **⚠️ vLLM version note (runtime fixes ship in the image):** all DSpark source
+> patches — including the concurrency-crash fix and the local scheduler-queue
+> lifetime fix from issue #26 — are baked into the runtime image
 > from `recipe/overlay/` at build time; there is **no runtime bind-mount** of
 > `dspark_proposer.py`. (A mounted proposer from one vLLM version crashes another
 > with `propose() got an unexpected keyword argument ...` — this took down a rig
