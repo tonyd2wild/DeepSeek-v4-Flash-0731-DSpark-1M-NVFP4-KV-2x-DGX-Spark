@@ -106,6 +106,10 @@ first (`start-*.sh` does not copy bind-mounted files to the worker):
 #   *** REQUIRED. Without this mount the draft's always-on shared expert loads uninitialised
 #   *** and decode runs at ~half speed, failing SILENTLY (the drop is a logger.debug line).
 -v /var/tmp/spec-dspark.py:/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py:ro \
+# Patch 6 — prefix cache kept alive on long conversations (source: recipe/overlay/vllm/v1/core/single_type_kv_cache_manager.py)
+#   Without it every long prefill evicts all other cached prefixes and the DSv4 prompt-block
+#   protection pins pages forever (docs/PATCH6-KV-CACHE-PREFIX-EVICTION.md).
+-v /var/tmp/patch6-single_type_kv_cache_manager.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/single_type_kv_cache_manager.py:ro \
 # Vision-model files (native image support): ds4v_model.py / ds4v_vision.py / ds4v_mm.py / ds4v_registry.py
 #   staged the same way onto the image's DeepSeek-V4 model + registry module paths.
 -v /var/tmp/ds4v_model.py:.../ds4v_model.py:ro \

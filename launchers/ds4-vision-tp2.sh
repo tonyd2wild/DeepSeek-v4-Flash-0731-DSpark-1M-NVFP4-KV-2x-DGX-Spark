@@ -32,6 +32,7 @@ test -d "$MODELS_HOST/$MODEL_DIR" || {
   echo "MODEL MISSING at $MODELS_HOST/$MODEL_DIR" >&2; exit 3; }
 test -f /var/tmp/patch3-scheduler.py || { echo "patch3-scheduler.py MISSING at /var/tmp" >&2; exit 4; }
 test -f /var/tmp/spec-dspark.py || { echo "spec-dspark.py (Patch 4, DSpark shared-expert loader fix) MISSING at /var/tmp — source: recipe/overlay/vllm/v1/spec_decode/dspark.py on main" >&2; exit 4; }
+test -f /var/tmp/patch6-single_type_kv_cache_manager.py || { echo "patch6-single_type_kv_cache_manager.py (Patch 6, prefix-cache eviction fix) MISSING at /var/tmp — source: recipe/overlay/vllm/v1/core/single_type_kv_cache_manager.py on main" >&2; exit 4; }
 
 mkdir -p "$HOME/.cache/vllm-dspark" "$HOME/.cache/huggingface"
 docker rm -f "$NAME" 2>/dev/null || true
@@ -48,6 +49,10 @@ docker run -d --name "$NAME" --restart no \
   -v "$HOME/.cache/huggingface:/cache/huggingface" \
   -v "$HOME/.cache/vllm-dspark:/vllm-cache" \
   -v /var/tmp/patch3-scheduler.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro \
+  `# Patch 6: cap prompt-block protection + recycle sliding-window pages in-request; without it long conversations lose their prefix cache (docs/PATCH6-KV-CACHE-PREFIX-EVICTION.md)` \
+  -v /var/tmp/patch6-single_type_kv_cache_manager.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/single_type_kv_cache_manager.py:ro \
+  -e VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION="${PROTECTED_FRACTION:-0.30}" \
+  -e VLLM_SWA_RECYCLE_SKIPPED_BLOCKS="${SWA_RECYCLE:-1}" \
   `# Patch 4: DSpark draft shared-expert loader fix. Without it the always-on shared expert loads uninitialised and the draft runs at ~half speed, silently (DSPARK-SHARED-EXPERT-FIX.md). Verify: scripts/check-patch4.sh` \
   -v /var/tmp/spec-dspark.py:/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py:ro \
   `# Vision-Exp port: DeepseekV4ForCausalLM has no vision tower/aligner, so the` \

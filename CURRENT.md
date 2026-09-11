@@ -31,9 +31,15 @@ Both launchers read `MODEL_DIR` (default `DeepSeek-V4-Flash-Vision-Exp`); the un
 
 **Preflight, on all four nodes:**
 
-- Patch 3 (`patch3-scheduler.py`), Patch 4 (`spec-dspark.py`) **and** the four vision port files
-  (`ds4v_model.py`, `ds4v_vision.py`, `ds4v_mm.py`, `ds4v_registry.py`) staged at `/var/tmp`.
-  The launcher checks all six and exits if any is missing.
+- Patch 3 (`patch3-scheduler.py`), Patch 4 (`spec-dspark.py`), Patch 6
+  (`patch6-single_type_kv_cache_manager.py`, source `recipe/overlay/vllm/v1/core/single_type_kv_cache_manager.py`)
+  **and** the four vision port files (`ds4v_model.py`, `ds4v_vision.py`, `ds4v_mm.py`, `ds4v_registry.py`)
+  staged at `/var/tmp`. The launcher checks all seven and exits if any is missing.
+- Patch 6 keeps the prefix cache alive on long conversations: both launchers pass
+  `VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION=${PROTECTED_FRACTION:-0.30}` and
+  `VLLM_SWA_RECYCLE_SKIPPED_BLOCKS=${SWA_RECYCLE:-1}`. Measured on TP2: a 354K-token prompt
+  re-sent after another 354K prefill hits 100% in 1.2 s (stock image: 0%, 235 s cold re-prefill);
+  logs in `docs/patch6-validation/`, analysis in `docs/PATCH6-KV-CACHE-PREFIX-EVICTION.md`.
 - Workers mount Bluey's weights export at `/mnt/bluey-models`.
 - **Drop page cache on all four nodes before launch.**
 
@@ -97,5 +103,7 @@ nothing a PR or issue links to changes path — `vision-exp/ds4-vision-tp2.sh` s
 The self-contained `sparkrun/` recipe serves under the id `deepseek-v4-flash-vision-exp`; the launchers here serve `deepseek-v4-flash-dspark`. Clients pointed at :8888 use the launcher's id.
 
 <!-- launcher hashes, maintained by tools/check-current.sh --write -->
-sha256 310e74b5a459f3cab876cd4d5edcbe67416ed74e408dfd965fd592a0bd0b1409  launchers/ds4-vision-tp2.sh
-sha256 3ace8ad8172c5a9c146e7dacc385b16d1e60049f65b7697527ec14eeead35ea4  launchers/ds4-vision-tp4.sh
+
+<!-- launcher hashes, maintained by tools/check-current.sh --write -->
+sha256 63a5f6c3ea32ecf764f76ac32ef7307dd637430301eab0ffc9bf0dbdd5d40531  launchers/ds4-vision-tp2.sh
+sha256 50b33b978f9c96ed318907519ff3f4e60abf15fb762c90345852e3c2cae1b266  launchers/ds4-vision-tp4.sh

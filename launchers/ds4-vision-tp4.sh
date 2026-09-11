@@ -28,7 +28,7 @@ case "$NODE_RANK" in
 esac
 
 test -d "$MODELS_HOST/$MODEL_DIR" || { echo "MODEL MISSING at $MODELS_HOST/$MODEL_DIR" >&2; exit 3; }
-for f in patch3-scheduler.py spec-dspark.py ds4v_model.py ds4v_vision.py ds4v_mm.py ds4v_registry.py; do
+for f in patch3-scheduler.py spec-dspark.py patch6-single_type_kv_cache_manager.py ds4v_model.py ds4v_vision.py ds4v_mm.py ds4v_registry.py; do
   test -f "/var/tmp/$f" || { echo "MISSING /var/tmp/$f" >&2; exit 4; }
 done
 
@@ -46,6 +46,10 @@ docker run -d --name "$NAME" --restart no \
   -v "$HOME/.cache/huggingface:/cache/huggingface" \
   -v "$HOME/.cache/vllm-dspark:/vllm-cache" \
   -v /var/tmp/patch3-scheduler.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro \
+  `# Patch 6: cap prompt-block protection + recycle sliding-window pages in-request (docs/PATCH6-KV-CACHE-PREFIX-EVICTION.md)` \
+  -v /var/tmp/patch6-single_type_kv_cache_manager.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/single_type_kv_cache_manager.py:ro \
+  -e VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION="${PROTECTED_FRACTION:-0.30}" \
+  -e VLLM_SWA_RECYCLE_SKIPPED_BLOCKS="${SWA_RECYCLE:-1}" \
   -v /var/tmp/spec-dspark.py:/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py:ro \
   -v /var/tmp/ds4v_model.py:/opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py:ro \
   -v /var/tmp/ds4v_vision.py:/opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/ds4v_vision.py:ro \

@@ -1,0 +1,150 @@
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1,10 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ from abc import ABC, abstractmethod
+ from collections import defaultdict, deque
+ from collections.abc import Sequence
+ 
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -27,8 +29,29 @@
+ )
+ from vllm.v1.request import Request
+ 
++logger = init_logger(__name__)
++
++# Patch 5 (2026-09-06): bound the prompt-block protection set.
++# Upstream-of-this-fork behaviour caps protected prompt blocks at
++# 2 * max_model_len / block_size per KV group, which at max_model_len=1M and
++# block_size=256 (8,192 blocks) exceeds the whole pool (6,911 blocks): the
++# protected set then grows by ~30 blocks per request and is released only
++# FIFO under allocation pressure, evicting the live conversation's prefix.
++# VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION bounds the total protected share of
++# the pool across all KV groups (default 0.30). Set to 0 to disable protection.
++_PROTECTED_FRACTION_ENV = "VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION"
++# Patch 6 (2026-09-06): sliding-window / compressor groups recycle the pages they
++# skip (remove_skipped_blocks) back into the SAME request instead of freeing them
++# to the global LRU queue and popping fresh pages from its head. With few-token
++# pages, one long prefill otherwise cycles the whole pool several times and
++# evicts every other request's cached prefix (0% hit on the next turn of a long
++# conversation). VLLM_SWA_RECYCLE_SKIPPED_BLOCKS=0 disables it.
++_RECYCLE_ENV = "VLLM_SWA_RECYCLE_SKIPPED_BLOCKS"
++_RECYCLE_ENABLED = os.environ.get(_RECYCLE_ENV, "1").strip() not in ("0", "false", "False", "")
++
+ 
+ class SingleTypeKVCacheManager(ABC):
++    _num_managers: int = 0  # Patch 5: managers share one block pool
+     """
+     An abstract base class for a manager that handle the kv cache management
+     logic of one specific type of attention layer.
+@@ -86,6 +109,12 @@
+         self._null_block = block_pool.null_block
+         self._protected_prompt_block_ids: set[int] = set()
+         self._protected_prompt_block_queue: deque[int] = deque()
++        SingleTypeKVCacheManager._num_managers += 1
++        self._protected_cap_logged = False
++        # Patch 6: pages skipped by the sliding window, still owned by the
++        # request (ref_cnt kept), reused for its next allocations.
++        self._recycled_blocks: dict[str, list[KVCacheBlock]] = defaultdict(list)
++        self._recycle_logged = False
+ 
+     @classmethod
+     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
+@@ -268,7 +297,19 @@
+         if num_new_blocks <= 0:
+             return []
+         else:
+-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
++            reused: list[KVCacheBlock] = []
++            recycled = self._recycled_blocks.get(request_id)
++            if recycled:
++                take = min(num_new_blocks, len(recycled))
++                reused = recycled[-take:]
++                del recycled[-take:]
++                num_new_blocks -= take
++            new_blocks = (
++                self.block_pool.get_new_blocks(num_new_blocks)
++                if num_new_blocks > 0
++                else []
++            )
++            new_blocks = reused + new_blocks
+             req_blocks.extend(new_blocks)
+             if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+                 self.new_block_ids.extend(b.block_id for b in new_blocks)
+@@ -281,9 +322,27 @@
+         return ids
+ 
+     def _max_protected_prompt_blocks(self) -> int | None:
+-        if self.max_model_len is None:
+-            return None
+-        return 2 * cdiv(max(1, self.max_model_len), self.block_size)
++        legacy: int | None = None
++        if self.max_model_len is not None:
++            legacy = 2 * cdiv(max(1, self.max_model_len), self.block_size)
++        try:
++            fraction = float(os.environ.get(_PROTECTED_FRACTION_ENV, "0.30"))
++        except ValueError:
++            fraction = 0.30
++        if fraction < 0:
++            return legacy
++        num_managers = max(1, SingleTypeKVCacheManager._num_managers)
++        pool_cap = int(self.block_pool.num_gpu_blocks * fraction / num_managers)
++        cap = pool_cap if legacy is None else min(legacy, pool_cap)
++        if not self._protected_cap_logged:
++            self._protected_cap_logged = True
++            logger.info(
++                "Patch 5: protected prompt block cap for KV group %d = %d blocks "
++                "(pool %d blocks, %d managers, fraction %.2f, legacy cap %s)",
++                self.kv_cache_group_id, cap, self.block_pool.num_gpu_blocks,
++                num_managers, fraction, legacy,
++            )
++        return cap
+ 
+     def _protect_prompt_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+         if not self.enable_caching:
+@@ -429,6 +488,9 @@
+ 
+         self.block_pool.free_blocks(ordered_blocks)
+         self.num_cached_block.pop(request_id, None)
++        leftover = self._recycled_blocks.pop(request_id, None)
++        if leftover:
++            self.block_pool.free_blocks(leftover)
+ 
+     @abstractmethod
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+@@ -536,7 +598,28 @@
+                 break
+             removed_blocks.append(blocks[i])
+             blocks[i] = self._null_block
+-        self.block_pool.free_blocks(removed_blocks)
++        if not _RECYCLE_ENABLED:
++            self.block_pool.free_blocks(removed_blocks)
++            return
++        to_free: list[KVCacheBlock] = []
++        recycled = self._recycled_blocks[request_id]
++        for blk in removed_blocks:
++            # Only pages held solely by this request can be reused in place;
++            # shared or protected pages keep their other references.
++            if blk.ref_cnt == 1 and not blk.is_null:
++                self.block_pool._maybe_evict_cached_block(blk)
++                recycled.append(blk)
++            else:
++                to_free.append(blk)
++        if to_free:
++            self.block_pool.free_blocks(to_free)
++        if not self._recycle_logged and recycled:
++            self._recycle_logged = True
++            logger.info(
++                "Patch 6: KV group %d recycling skipped pages in-request "
++                "(first request %s, %d pages)",
++                self.kv_cache_group_id, request_id, len(recycled),
++            )
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+         """

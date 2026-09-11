@@ -199,3 +199,16 @@ unchanged.
   illegal-memory / IMA crash appears.
 - `draft_sample_method=probabilistic` is a valid tuning option but is **not**
   needed to fix this garble once the scheduler guard is in place.
+
+---
+
+## Patch 6 — prefix cache lost on long conversations (protection cap + SWA page recycling)
+
+Long-context agent sessions saw the first call of most turns re-prefill the whole prompt
+(235 s for ~400K tokens) although identical resends hit 100%. Two causes in
+`vllm/v1/core/single_type_kv_cache_manager.py`: the DSv4 prompt-block protection has an
+effectively infinite cap at 1M context (pins ~30–60 pages per request, forever), and the
+sliding-window/compressor groups churn the shared LRU during any long prefill, evicting
+every other cached prefix. See `docs/PATCH6-KV-CACHE-PREFIX-EVICTION.md` for the analysis,
+the fix and the validation table; file: `recipe/overlay/vllm/v1/core/single_type_kv_cache_manager.py`,
+diff: `patches/0006-kv-cache-prompt-protection-cap-and-swa-recycle.patch`.
